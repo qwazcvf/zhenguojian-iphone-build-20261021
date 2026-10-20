@@ -1,0 +1,157 @@
+name: Build unsigned iPhone IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: 'Flutter version: stable or a specific compatible release'
+        required: true
+        default: stable
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOSUMDB: sum.golang.org
+      COCOAPODS_DISABLE_STATS: 'true'
+    steps:
+      - name: Fetch reviewed related source
+        uses: actions/checkout@v4
+        with:
+          repository: maohaodong/zhenguojian-app
+          ref: cd467024e8547808f70de2066e2b0ba5adffc295
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Install current stable Flutter
+        if: inputs.flutter_version == 'stable'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install requested Flutter version
+        if: inputs.flutter_version != 'stable'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      - name: Check Apple toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ios
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            flutter --version
+            go version
+          } | tee dist/ios/build-environment.txt
+          if ! command -v pod >/dev/null; then
+            gem install cocoapods --user-install --no-document
+            export PATH="$(ruby -e 'print Gem.user_dir')/bin:$PATH"
+            echo "$(ruby -e 'print Gem.user_dir')/bin" >> "$GITHUB_PATH"
+          fi
+          pod --version
+          flutter precache --ios
+
+      - name: Build application and native core without signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_ios.py --all-sources 2>&1 | tee dist/ios/build.log
+
+      - name: Validate bundle and package IPA for personal signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import plistlib
+          import subprocess
+          import zipfile
+
+          app = pathlib.Path('build/ios/iphoneos/Runner.app')
+          output = pathlib.Path('dist/ios')
+          if not app.is_dir():
+              raise SystemExit('Runner.app is missing')
+          info = plistlib.loads((app / 'Info.plist').read_bytes())
+          executable = app / info['CFBundleExecutable']
+          if 'iPhoneOS' not in info.get('CFBundleSupportedPlatforms', []):
+              raise SystemExit('Expected a physical iPhone build')
+          architectures = subprocess.check_output(
+              ['xcrun', 'lipo', '-archs', str(executable)], text=True).strip()
+          if 'arm64' not in architectures.split():
+              raise SystemExit('Missing arm64 executable')
+          for framework in ['App', 'Flutter']:
+              binary = app / 'Frameworks' / (framework + '.framework') / framework
+              if not binary.is_file():
+                  raise SystemExit('Missing Flutter framework: ' + framework)
+          stage = output / 'ipa-stage'
+          payload = stage / 'Payload'
+          payload.mkdir(parents=True, exist_ok=True)
+          subprocess.run(['ditto', str(app), str(payload / app.name)], check=True)
+          ipa = output / 'zhenguojian-ios-arm64-unsigned-unverified.ipa'
+          subprocess.run(['ditto', '-c', '-k', '--keepParent',
+                          str(payload), str(ipa)], check=True)
+          with zipfile.ZipFile(ipa) as archive:
+              if 'Payload/Runner.app/Info.plist' not in archive.namelist():
+                  raise SystemExit('Invalid IPA payload layout')
+          report = {
+              'source_repository': 'maohaodong/zhenguojian-app',
+              'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'bundle_identifier': info.get('CFBundleIdentifier'),
+              'version': info.get('CFBundleShortVersionString'),
+              'minimum_ios': info.get('MinimumOSVersion'),
+              'architectures': architectures,
+              'signed_for_installation': False,
+              'device_launch_verified': False,
+              'original_lite_apk_source_match_verified': False,
+          }
+          (output / 'bundle-check.json').write_text(json.dumps(report, indent=2) + '\n')
+          (output / 'IPA-SHA256.txt').write_text(
+              hashlib.sha256(ipa.read_bytes()).hexdigest() + '  ' + ipa.name + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Downloadable unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhenguojian-unsigned-IPA-unverified
+          path: |
+            dist/ios/*.ipa
+            dist/ios/IPA-SHA256.txt
+            dist/ios/bundle-check.json
+            dist/ios/build-environment.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Save build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics
+          path: |
+            dist/ios/build.log
+            dist/ios/build-environment.txt
+          if-no-files-found: ignore
+          retention-days: 14
