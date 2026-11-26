@@ -1,0 +1,110 @@
+name: Build iOS IPA from upstream source
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'kuoluoss/zhenguojian ref to build (tag, branch or commit)'
+        required: true
+        default: 'v0.9.0'
+        type: string
+      edition:
+        description: 'Optional edition flag passed to scripts/build_ios.py (blank = default)'
+        required: false
+        default: ''
+        type: string
+      simulator:
+        description: 'Also build simulator slices (slower)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOSUMDB: sum.golang.org
+      COCOAPODS_DISABLE_STATS: 'true'
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: kuoluoss/zhenguojian
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Install current stable Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Check Apple toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ios
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            flutter --version
+            go version
+          } | tee dist/ios/build-environment.txt
+          if ! command -v pod >/dev/null; then
+            gem install cocoapods --user-install --no-document
+            export PATH="$(ruby -e 'print Gem.user_dir')/bin:$PATH"
+            echo "$(ruby -e 'print Gem.user_dir')/bin" >> "$GITHUB_PATH"
+          fi
+          pod --version
+          flutter precache --ios
+
+      - name: Build unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=""
+          if [ -n "${{ inputs.edition }}" ]; then ARGS="$ARGS --edition ${{ inputs.edition }}"; fi
+          if [ "${{ inputs.simulator }}" = "true" ]; then ARGS="$ARGS --simulator"; fi
+          python3 scripts/build_ios.py $ARGS 2>&1 | tee dist/ios/build.log || {
+            mkdir -p dist/ios
+            cp -f dist/ios/build.log dist/ios/build.log || true
+            exit 1
+          }
+          cp -f dist/ios/SHA256SUMS.txt dist/ios/ 2>/dev/null || true
+
+      - name: Collect artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ios
+          ls -la dist/ios || true
+          if [ -f dist/ios/SHA256SUMS.txt ]; then cat dist/ios/SHA256SUMS.txt; fi
+
+      - name: Upload unsigned IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhenguojian-ios-unsigned
+          path: |
+            dist/ios/*.ipa
+            dist/ios/SHA256SUMS.txt
+            dist/ios/build-environment.txt
+            dist/ios/build.log
+          if-no-files-found: warn
+          retention-days: 14
